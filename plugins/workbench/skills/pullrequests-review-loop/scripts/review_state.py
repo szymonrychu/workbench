@@ -67,15 +67,15 @@ def _substantive(body) -> bool:
 
 def reviews_by_reviewer(reviews: list, reviewer: str, head_sha: str) -> list:
     """Reviews authored by `reviewer`, newest first, tagged onHead."""
-    mine = [r for r in reviews if (r.get("author") or {}).get("login") == reviewer]
-    mine.sort(key=lambda r: r.get("submittedAt") or "", reverse=True)
+    mine = [r for r in reviews if (r.get("user") or {}).get("login") == reviewer]
+    mine.sort(key=lambda r: r.get("submitted_at") or "", reverse=True)
     out = []
     for r in mine:
-        commit_id = (r.get("commit") or {}).get("oid", "")
+        commit_id = r.get("commit_id") or ""
         out.append(
             {
                 "state": r.get("state", "UNKNOWN"),
-                "submittedAt": r.get("submittedAt", ""),
+                "submittedAt": r.get("submitted_at") or "",
                 "commitId": commit_id,
                 "onHead": commit_id == head_sha,
                 "body": r.get("body", ""),
@@ -123,21 +123,21 @@ def is_actionable(decision: str, reviews_all: list, inline_comments: list) -> bo
 
 
 def fetch_pr_state(adapter: scm.GitHub, num: int, reviewer: str) -> dict:
-    data = adapter.json(
-        ["pr", "view", str(num), "--json", "headRefOid,state,mergeable,url,reviews"]
-    )
-    head_sha = data.get("headRefOid", "")
-    comments = adapter.json(["api", f"repos/{adapter.slug}/pulls/{num}/comments"])
+    # REST only: `gh pr view` is GraphQL, which Claude Code cloud sessions block.
+    pull = adapter.pull_view(adapter.json(["api", f"repos/{adapter.slug}/pulls/{num}"]))
+    head_sha = pull["headRefOid"]
+    reviews = adapter.pages(f"repos/{adapter.slug}/pulls/{num}/reviews?per_page=100")
+    comments = adapter.pages(f"repos/{adapter.slug}/pulls/{num}/comments?per_page=100")
 
-    reviews_all = reviews_by_reviewer(data.get("reviews") or [], reviewer, head_sha)
-    inline_comments = comments_by_reviewer(comments or [], reviewer, head_sha)
+    reviews_all = reviews_by_reviewer(reviews, reviewer, head_sha)
+    inline_comments = comments_by_reviewer(comments, reviewer, head_sha)
     decision = decision_on_head(reviews_all)
 
     return {
         "headSha": head_sha,
-        "prState": data.get("state", "UNKNOWN"),
-        "mergeable": data.get("mergeable", "UNKNOWN"),
-        "url": data.get("url", ""),
+        "prState": pull["state"],
+        "mergeable": pull["mergeable"],
+        "url": pull["url"],
         "reviewerDecisionOnHead": decision,
         "reviewsAll": reviews_all,
         "inlineComments": inline_comments,

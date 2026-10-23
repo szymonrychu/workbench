@@ -701,8 +701,12 @@ def test_local_only_repo_skipped(mixed_workbench, mixed_stubs, run_mixed, capsys
     row = [line for line in out.splitlines() if line.startswith("plain-repo")][0]
     assert "skipped" in row
     assert "local-only: no PR/MR host for git@git.internal.example:acme/plain-repo.git" in row
-    gh_edit = [c for c in mixed_stubs() if c[:3] == ["gh", "pr", "edit"] and "--body" in c]
-    assert "Complementary" not in gh_edit[0][gh_edit[0].index("--body") + 1]
+    gh_edit = [
+        c
+        for c in mixed_stubs()
+        if c[:4] == ["gh", "api", "-X", "PATCH"] and any(a.startswith("body=") for a in c)
+    ]
+    assert "Complementary" not in [a for a in gh_edit[0] if a.startswith("body=")][0]
 
 
 def test_host_map_routes_unknown_hostname(

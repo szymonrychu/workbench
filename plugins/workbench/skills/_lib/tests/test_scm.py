@@ -102,6 +102,7 @@ def shim(tmp_path, monkeypatch):
     # Inherited host pins that must never reach the CLI.
     monkeypatch.setenv("GH_HOST", "evil.example")
     monkeypatch.setenv("GITLAB_HOST", "evil.example")
+    monkeypatch.delenv("CLAUDE_CODE_REMOTE", raising=False)
 
     class Shim:
         def respond(self, *new_rules):
@@ -545,100 +546,129 @@ def test_non_default_port_kept(workbench, shim, monkeypatch):
     assert shim.last()["argv"] == ["pr", "list", "-R", "ghe.corp:8443/acme/tool"]
 
 
-# --- GitHub update operations ---------------------------------------------------
+# --- GitHub update operations (REST: GraphQL is blocked in cloud sessions) --------
 
 
 def test_github_find_open(workbench, shim):
     shim.respond(
-        {"match": ["pr", "list"], "stdout": json.dumps([{"number": 5, "url": "https://u/5"}])}
+        {
+            "match": ["repos/acme/app/pulls?state=open&head=acme:feat/x"],
+            "stdout": json.dumps([{"number": 5, "html_url": "https://u/5"}]),
+        }
     )
     assert scm.adapter_for("app").find_open("feat/x") == (5, "https://u/5")
-    assert shim.last()["argv"] == [
-        "pr",
-        "list",
-        "--head",
-        "feat/x",
-        "--json",
-        "number,url",
-        "-R",
-        "acme/app",
-    ]
+    assert shim.last()["argv"] == ["api", "repos/acme/app/pulls?state=open&head=acme:feat/x"]
 
 
 def test_github_find_open_none(workbench, shim):
-    shim.respond({"match": ["pr", "list"], "stdout": "[]"})
+    shim.respond({"match": ["api"], "stdout": "[]"})
     assert scm.adapter_for("app").find_open("feat/x") is None
 
 
-def test_github_create_passes_no_base(workbench, shim):
-    shim.respond({"match": ["pr", "create"], "stdout": "https://github.com/acme/app/pull/8\n"})
+def test_github_create_targets_default_branch(workbench, shim):
+    shim.respond(
+        {
+            "match": ["POST"],
+            "stdout": json.dumps({"html_url": "https://github.com/acme/app/pull/8"}),
+        },
+        {"match": ["repos/acme/app"], "stdout": json.dumps({"default_branch": "trunk"})},
+    )
     url = scm.adapter_for("app").create("feat/x", "Title", "Body")
     assert url == "https://github.com/acme/app/pull/8"
-    argv = shim.last()["argv"]
-    assert argv == [
-        "pr",
-        "create",
-        "--head",
-        "feat/x",
-        "--title",
-        "Title",
-        "--body",
-        "Body",
-        "-R",
-        "acme/app",
+    assert [c["argv"] for c in shim.calls()] == [
+        ["api", "repos/acme/app"],
+        [
+            "api",
+            "-X",
+            "POST",
+            "repos/acme/app/pulls",
+            "-f",
+            "head=feat/x",
+            "-f",
+            "base=trunk",
+            "-f",
+            "title=Title",
+            "-f",
+            "body=Body",
+        ],
     ]
-    assert "--base" not in argv
 
 
 def test_github_edit_body(workbench, shim):
     scm.adapter_for("tool").edit_body(5, "new body")
     assert shim.last()["argv"] == [
-        "pr",
-        "edit",
-        "5",
-        "--body",
-        "new body",
-        "-R",
-        "ghe.corp/acme/tool",
+        "api",
+        "-X",
+        "PATCH",
+        "repos/acme/tool/pulls/5",
+        "-f",
+        "body=new body",
+        "--hostname",
+        "ghe.corp",
     ]
 
 
 def test_github_semver_label(workbench, shim):
-    labels = {"labels": [{"name": "bug"}, {"name": "semver:minor"}]}
-    shim.respond({"match": ["pr", "view"], "stdout": json.dumps(labels)})
+    pages = [[{"name": "bug"}], [{"name": "semver:minor"}]]
+    shim.respond({"match": ["--slurp"], "stdout": json.dumps(pages)})
     assert scm.adapter_for("app").semver_label(5) == "minor"
-    assert shim.last()["argv"] == ["pr", "view", "5", "--json", "labels", "-R", "acme/app"]
+    assert shim.last()["argv"] == [
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/acme/app/issues/5/labels?per_page=100",
+    ]
 
 
 def test_github_semver_label_none(workbench, shim):
-    shim.respond({"match": ["pr", "view"], "stdout": json.dumps({"labels": [{"name": "x"}]})})
+    shim.respond({"match": ["--slurp"], "stdout": json.dumps([[{"name": "x"}]])})
     assert scm.adapter_for("app").semver_label(5) is None
 
 
-def test_github_ensure_label(workbench, shim):
+def test_github_ensure_label_creates(workbench, shim):
     scm.adapter_for("app").ensure_label("patch")
-    assert shim.last()["argv"] == [
-        "label",
-        "create",
-        "semver:patch",
-        "--color",
-        "0e8a16",
-        "--force",
-        "-R",
-        "acme/app",
+    assert [c["argv"] for c in shim.calls()] == [
+        [
+            "api",
+            "-X",
+            "POST",
+            "repos/acme/app/labels",
+            "-f",
+            "name=semver:patch",
+            "-f",
+            "color=0e8a16",
+        ]
     ]
+
+
+def test_github_ensure_label_existing_is_recoloured(workbench, shim):
+    shim.respond({"match": ["POST"], "stderr": "gh: Validation Failed (HTTP 422)\n", "exit": 1})
+    scm.adapter_for("app").ensure_label("minor")
+    assert shim.last()["argv"] == [
+        "api",
+        "-X",
+        "PATCH",
+        "repos/acme/app/labels/semver%3Aminor",
+        "-f",
+        "color=fbca04",
+    ]
+
+
+def test_github_ensure_label_raises_other_errors(workbench, shim):
+    shim.respond({"match": ["POST"], "stderr": "gh: Forbidden (HTTP 403)\n", "exit": 1})
+    with pytest.raises(common.RepoError, match="403"):
+        scm.adapter_for("app").ensure_label("minor")
 
 
 def test_github_apply_label(workbench, shim):
     scm.adapter_for("app").apply_label(5, "major")
     assert shim.last()["argv"] == [
-        "pr",
-        "edit",
-        "5",
-        "--add-label",
-        "semver:major",
-        "-R",
-        "acme/app",
+        "api",
+        "-X",
+        "POST",
+        "repos/acme/app/issues/5/labels",
+        "-f",
+        "labels[]=semver:major",
     ]
 
 
@@ -840,12 +870,25 @@ def test_ref_is_host_native(workbench):
 
 def test_update_operations_both_hosts(workbench, shim):
     shim.respond(
-        {"cli": "gh", "match": ["pr", "list"], "stdout": json.dumps([{"number": 5, "url": "u5"}])},
-        {"cli": "gh", "match": ["pr", "create"], "stdout": "u6\n"},
         {
             "cli": "gh",
-            "match": ["pr", "view"],
-            "stdout": json.dumps({"labels": [{"name": "semver:minor"}]}),
+            "match": ["repos/acme/app/pulls?state=open&head=acme:feat/x"],
+            "stdout": json.dumps([{"number": 5, "html_url": "u5"}]),
+        },
+        {
+            "cli": "gh",
+            "match": ["repos/acme/app"],
+            "stdout": json.dumps({"default_branch": "main"}),
+        },
+        {
+            "cli": "gh",
+            "match": ["POST", "repos/acme/app/pulls"],
+            "stdout": json.dumps({"html_url": "u6"}),
+        },
+        {
+            "cli": "gh",
+            "match": ["--slurp"],
+            "stdout": json.dumps([[{"name": "semver:minor"}]]),
         },
         {
             "cli": "glab",
@@ -860,12 +903,12 @@ def test_update_operations_both_hosts(workbench, shim):
     gh = scm.adapter_for("app")
     assert gh.find_open("feat/x") == (5, "u5")
     assert gh.create("feat/x", "T", "B") == "u6"
-    assert "--base" not in shim.last()["argv"]
+    assert "base=main" in shim.last()["argv"]
     gh.edit_body(5, "b")
     assert gh.semver_label(5) == "minor"
     gh.ensure_label("patch")
     gh.apply_label(5, "patch")
-    assert shim.last()["argv"][:4] == ["pr", "edit", "5", "--add-label"]
+    assert shim.last()["argv"][3:5] == ["repos/acme/app/issues/5/labels", "-f"]
 
     gl = scm.adapter_for("proj")
     assert gl.find_open("feat/x") == (7, "u7")

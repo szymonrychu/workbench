@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -5,7 +6,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_lib" / "tests"))
 
+import fake_gh_rest  # noqa: E402
 import list as plist  # noqa: E402
 import scm  # noqa: E402
 
@@ -185,3 +188,48 @@ def test_description_is_body_on_both_hosts(monkeypatch, capsys, make):
     item["title"] = "the title"
     _, out = run(monkeypatch, capsys, FakeAdapter([item]))
     assert "the body" in out and "the title" not in out
+
+
+# -- a real GitHub adapter over the REST routes (no gh pr / graphql) --
+
+GH_REST_SHIM = fake_gh_rest.shim(
+    """#!/usr/bin/env python3
+import sys
+
+sys.path.insert(0, "__FAKE_GH_DIR__")
+import fake_gh_rest
+
+PASS = [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+FAIL = [{"name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}]
+WORLD = {
+    "slug": "acme/repo1",
+    "prs": {
+        "1": {"state": "OPEN", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+              "body": "good one", "createdAt": "2026-01-01T00:00:00Z", "statusCheckRollup": PASS},
+        "2": {"state": "OPEN", "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY",
+              "body": "conflicted", "createdAt": "2026-02-01T00:00:00Z", "statusCheckRollup": PASS},
+        "3": {"state": "OPEN", "mergeable": "MERGEABLE", "mergeStateStatus": "UNSTABLE",
+              "body": "red", "createdAt": "2026-03-01T00:00:00Z", "statusCheckRollup": FAIL},
+    },
+}
+code = fake_gh_rest.serve(sys.argv[1:], WORLD) if sys.argv[1] == "api" else None
+sys.exit(1 if code is None else code)
+"""
+)
+
+
+def test_github_list_end_to_end_over_rest(monkeypatch, capsys, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text(GH_REST_SHIM)
+    (bin_dir / "gh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    adapter = scm.GitHub("r", "github.com", "acme/repo1")
+    code, out = run(monkeypatch, capsys, adapter)
+    assert code == 1
+    rows = out.splitlines()[2:]
+    assert [r.split(None, 2)[1:] for r in rows] == [
+        ["G", "good one"],
+        ["C", "conflicted"],
+        ["R", "red"],
+    ]

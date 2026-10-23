@@ -12,8 +12,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_lib" / "tests"))
 
 import common  # noqa: E402
+import fake_gh_rest  # noqa: E402
 import scm  # noqa: E402
 import watch  # noqa: E402
 
@@ -77,12 +79,16 @@ def fake_clock(monkeypatch):
     return state
 
 
-GH_SHIM = textwrap.dedent(
-    f"""\
+GH_SHIM = fake_gh_rest.shim(
+    textwrap.dedent(
+        f"""\
     #!/usr/bin/env python3
     import json
     import pathlib
     import sys
+
+    sys.path.insert(0, "__FAKE_GH_DIR__")
+    import fake_gh_rest
 
     SHA_OK = "{SHA_OK}"
     SHA_BAD = "{SHA_BAD}"
@@ -94,10 +100,11 @@ GH_SHIM = textwrap.dedent(
     LOG = pathlib.Path(__file__).with_name("argv.log")
 
     PRS = {{
-        "501": {{"state": "MERGED", "mergeCommit": {{"oid": SHA_OK}}, "baseRefName": "main"}},
-        "502": {{"state": "MERGED", "mergeCommit": {{"oid": SHA_BAD}}, "baseRefName": "main"}},
+        "501": {{"state": "MERGED", "mergeCommit": SHA_OK, "baseRefName": "main"}},
+        "502": {{"state": "MERGED", "mergeCommit": SHA_BAD, "baseRefName": "main"}},
         "503": {{"state": "OPEN", "mergeCommit": None, "baseRefName": "main"}},
     }}
+    WORLD = {{"slug": "acme/repo1", "default_branch": "trunk", "prs": PRS}}
     TIPS = {{"trunk": SHA_TIP, "release": SHA_REL, "main": SHA_OK}}
 
     def run(rid, wf, status, conclusion, sha, n=1):
@@ -141,16 +148,6 @@ GH_SHIM = textwrap.dedent(
         argv = sys.argv[1:]
         with LOG.open("a") as f:
             f.write(json.dumps(argv) + "\\n")
-        if argv[:2] == ["pr", "view"]:
-            n = argv[2]
-            if n not in PRS:
-                sys.stderr.write("GraphQL: Could not resolve to a PullRequest\\n")
-                sys.exit(1)
-            print(json.dumps(PRS[n]))
-            return
-        if argv[:2] == ["repo", "view"]:
-            print(json.dumps({{"defaultBranchRef": {{"name": "trunk"}}}}))
-            return
         if argv[0] == "api":
             prefix = "repos/acme/repo1/branches/"
             path = argv[1]
@@ -163,6 +160,9 @@ GH_SHIM = textwrap.dedent(
                         sys.exit(1)
                     print(json.dumps({{"name": b, "commit": {{"sha": TIPS[b]}}}}))
                     return
+            code = fake_gh_rest.serve(argv, WORLD)
+            if code is not None:
+                sys.exit(code)
         if argv[:2] == ["run", "list"]:
             assert opt(argv, "--event") == "push", argv
             sha = opt(argv, "--commit")
@@ -192,6 +192,7 @@ GH_SHIM = textwrap.dedent(
 
     main()
     """
+    )
 )
 
 
@@ -315,7 +316,7 @@ def test_deploy_failed_reasons_empty_unless_failed(workbench, gh_shim):
     assert gh.deploy_failed_reasons(gh.poll_deploy("main", SHA_OK)) == []
 
 
-def test_default_branch_reads_repo_view(workbench, gh_shim):
+def test_default_branch_reads_the_repo_default_branch(workbench, gh_shim):
     assert _gh().default_branch() == "trunk"
 
 

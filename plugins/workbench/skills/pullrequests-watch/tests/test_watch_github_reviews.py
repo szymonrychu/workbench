@@ -13,8 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_lib"))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_lib" / "tests"))
 
 import common  # noqa: E402
+import fake_gh_rest  # noqa: E402
 import scm  # noqa: E402
 import test_watch_github as base  # noqa: E402
 import watch  # noqa: E402
@@ -22,12 +24,16 @@ import watch  # noqa: E402
 # PR 201: open, 3 threads (1 unresolved, 1 resolved, 1 unresolved+outdated) -> 2.
 # PR 202: open, 150 threads over two pages, every 3rd resolved.
 # PR 203: merged.  PR 204: open, graphql errors.  PR 205: open, no threads.
-GH_SHIM = textwrap.dedent(
-    """\
+GH_SHIM = fake_gh_rest.shim(
+    textwrap.dedent(
+        """\
     #!/usr/bin/env python3
     import json
     import pathlib
     import sys
+
+    sys.path.insert(0, "__FAKE_GH_DIR__")
+    import fake_gh_rest
 
     LOG = pathlib.Path(__file__).with_name("calls.jsonl")
     PRS = {
@@ -56,20 +62,31 @@ GH_SHIM = textwrap.dedent(
         argv = sys.argv[1:]
         with LOG.open("a") as fh:
             fh.write(json.dumps(argv) + "\\n")
-        if argv[:2] == ["pr", "view"]:
-            num = argv[2]
-            fields = argv[argv.index("--json") + 1].split(",")
-            data = {
-                "state": PRS[num],
-                "mergeable": "MERGEABLE",
-                "mergeStateStatus": "CLEAN",
-                "url": f"https://github.com/acme/repo1/pull/{num}",
-                "statusCheckRollup": [
-                    {"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}
-                ],
-            }
-            print(json.dumps({k: data[k] for k in fields if k in data}))
+        if argv[0] == "api" and "ccr/review_threads" in argv[1]:
+            num = argv[1].split("/")[-3]
+            if num == "204":
+                sys.stderr.write("gh: HTTP 502\\n")
+                sys.exit(1)
+            print(json.dumps(THREADS.get(num, [])))
             return
+        if argv[0] == "api" and argv[1] != "graphql":
+            world = {
+                "slug": "acme/repo1",
+                "prs": {
+                    num: {
+                        "state": state,
+                        "mergeable": "MERGEABLE",
+                        "mergeStateStatus": "CLEAN",
+                        "statusCheckRollup": [
+                            {"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}
+                        ],
+                    }
+                    for num, state in PRS.items()
+                },
+            }
+            code = fake_gh_rest.serve(argv, world)
+            if code is not None:
+                sys.exit(code)
         if argv[:2] == ["api", "graphql"]:
             num = arg(argv, "number")
             if num == "204":
@@ -93,12 +110,14 @@ GH_SHIM = textwrap.dedent(
     if __name__ == "__main__":
         main()
     """
+    )
 )
 
 
 @pytest.fixture(autouse=True)
 def _no_host_map(monkeypatch):
     monkeypatch.delenv(scm.HOSTS_ENV, raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_REMOTE", raising=False)
 
 
 @pytest.fixture
@@ -225,3 +244,45 @@ def test_mixed_hosts_both_carry_reviews(tmp_path, monkeypatch, gh, capsys):
     rows = capsys.readouterr().out.splitlines()[1:]
     assert "pr #201:" in rows[0] and "reviews=2 unresolved" in rows[0]
     assert "mr !201:" in rows[1] and "reviews=0 unresolved" in rows[1]
+
+
+# -- in a Claude Code cloud session graphql is blocked: the proxy's REST route --
+
+
+def _review_thread_calls(gh):
+    return [c for c in gh() if c[0] == "api" and "ccr/review_threads" in c[1]]
+
+
+def test_cloud_counts_unresolved_threads_over_rest(gh, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+    assert _adapter().unresolved_reviews(201) == 2
+    assert _review_thread_calls(gh) == [["api", "repos/acme/repo1/pulls/201/ccr/review_threads"]]
+    assert gh(["api", "graphql"]) == []
+
+
+def test_cloud_threads_past_the_first_hundred_come_in_one_call(gh, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+    assert _adapter().unresolved_reviews(202) == 100
+    assert len(_review_thread_calls(gh)) == 1
+
+
+def test_cloud_poll_and_detail_carry_reviews_without_graphql(gh, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+    adapter = _adapter()
+    ok, detail = watch.build_detail(adapter, 201, adapter.poll(201))
+    assert ok is True
+    assert "reviews=2 unresolved" in detail
+    assert gh(["api", "graphql"]) == []
+
+
+def test_cloud_merged_pr_makes_no_review_call(gh, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+    assert "reviews" not in _adapter().poll(203)
+    assert _review_thread_calls(gh) == []
+
+
+def test_cloud_poll_degrades_when_the_route_fails(gh, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+    poll = _adapter().poll(204)
+    assert poll["checks"] == "passed"
+    assert "reviews" not in poll

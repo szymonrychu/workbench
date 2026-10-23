@@ -52,6 +52,7 @@ def shim(tmp_path, monkeypatch):
     rules = tmp_path / "rules.json"
     monkeypatch.setenv("SHIM_LOG", str(log))
     monkeypatch.setenv("SHIM_RULES", str(rules))
+    monkeypatch.delenv("CLAUDE_CODE_REMOTE", raising=False)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
 
     class Shim:
@@ -84,32 +85,90 @@ def _ok(conclusion="SUCCESS", **extra):
     return {"name": "ok", "status": "COMPLETED", "conclusion": conclusion, **extra}
 
 
+GH = "repos/acme/app"
+
+
+def _rest_check(conclusion="success", name="ok", status="completed", url=None):
+    return {"name": name, "status": status, "conclusion": conclusion, "details_url": url}
+
+
+def _rest_pull(num=12, sha="abc123", **extra):
+    return {
+        "number": num,
+        "state": "open",
+        "merged": False,
+        "mergeable": True,
+        "mergeable_state": "clean",
+        "html_url": f"https://github.com/acme/app/pull/{num}",
+        "head": {"sha": sha},
+        "base": {"ref": "main"},
+        **extra,
+    }
+
+
+def gh_pull_rules(pull=None, check_runs=(), statuses=(), num=12):
+    """gh rules answering the three REST reads one GitHub snapshot of PR `num` makes."""
+    pull = pull or _rest_pull(num)
+    sha = pull["head"]["sha"]
+    return [
+        {"cli": "gh", "match": [f"{GH}/pulls/{num}"], "stdout": json.dumps(pull)},
+        {
+            "cli": "gh",
+            "match": [f"{GH}/commits/{sha}/check-runs?per_page=100"],
+            "stdout": json.dumps(
+                [{"total_count": len(check_runs), "check_runs": list(check_runs)}]
+            ),
+        },
+        {
+            "cli": "gh",
+            "match": [f"{GH}/commits/{sha}/status?per_page=100"],
+            "stdout": json.dumps({"statuses": list(statuses)}),
+        },
+    ]
+
+
 # --- resolve_branch ---------------------------------------------------------
 
 
 def test_resolve_branch_both_hosts(shim, hosts):
     github, gitlab = hosts
     shim.respond(
-        {"cli": "gh", "match": ["feat/x"], "stdout": json.dumps({"number": 12})},
+        {
+            "cli": "gh",
+            "match": [
+                f"{GH}/pulls?head=acme:feat/x&state=all&sort=created&direction=desc&per_page=1"
+            ],
+            "stdout": json.dumps([{"number": 12}]),
+        },
         {"cli": "glab", "match": [], "stdout": json.dumps([{"iid": 7, "web_url": "u"}])},
     )
     assert github.resolve_branch("feat/x") == 12
     assert gitlab.resolve_branch("feat/x") == 7
     gh_call, gl_call = shim.calls()
-    assert gh_call["argv"] == ["pr", "view", "feat/x", "--json", "number", "-R", "acme/app"]
+    assert gh_call["argv"] == [
+        "api",
+        f"{GH}/pulls?head=acme:feat/x&state=all&sort=created&direction=desc&per_page=1",
+    ]
     assert gl_call["argv"] == ["api", f"{GL_MR}?source_branch=feat%2Fx&state=opened"]
 
 
 def test_resolve_branch_none_raises_naming_branch(shim, hosts):
     github, gitlab = hosts
     shim.respond(
-        {"cli": "gh", "stderr": "no pull requests found for branch", "exit": 1},
+        {"cli": "gh", "stdout": "[]"},
         {"cli": "glab", "stdout": "[]"},
     )
     with pytest.raises(common.RepoError, match=r"^branch feat/x: no PR found \("):
         github.resolve_branch("feat/x")
     with pytest.raises(common.RepoError, match=r"^branch feat/x: no MR found \("):
         gitlab.resolve_branch("feat/x")
+
+
+def test_resolve_branch_cli_failure_raises_naming_branch(shim, hosts):
+    github, _ = hosts
+    shim.respond({"cli": "gh", "stderr": "gh: Not Found (HTTP 404)", "exit": 1})
+    with pytest.raises(common.RepoError, match=r"^branch feat/x: no PR found \(.*404"):
+        github.resolve_branch("feat/x")
 
 
 def test_resolve_branch_malformed_answer_raises(shim, hosts):
@@ -146,85 +205,145 @@ def test_resolve_branch_malformed_answer_raises(shim, hosts):
         ([{"name": "a"}, _ok("FAILURE")], "failed"),
     ],
 )
-def test_poll_github_reduces_checks(shim, hosts, rollup, checks):
+def test_reduce_checks_vocabulary(rollup, checks):
+    assert scm.GitHub.reduce_checks(rollup) == checks
+
+
+@pytest.mark.parametrize(
+    "check_runs,statuses,checks",
+    [
+        ([], [], "none"),
+        ([_rest_check()], [], "passed"),
+        ([_rest_check("skipped"), _rest_check("neutral")], [], "passed"),
+        ([_rest_check(), _rest_check("failure")], [], "failed"),
+        ([_rest_check("timed_out")], [], "failed"),
+        ([_rest_check("cancelled")], [], "failed"),
+        ([_rest_check(None, status="in_progress")], [], "pending"),
+        ([_rest_check(None, status="queued")], [], "pending"),
+        ([], [{"context": "ci", "state": "success"}], "passed"),
+        ([], [{"context": "ci", "state": "pending"}], "pending"),
+        ([], [{"context": "ci", "state": "failure"}], "failed"),
+        ([], [{"context": "ci", "state": "error"}], "failed"),
+        ([_rest_check()], [{"context": "ci", "state": "pending"}], "pending"),
+        ([_rest_check()], [{"context": "ci", "state": "error"}], "failed"),
+    ],
+)
+def test_poll_github_reduces_rest_checks(shim, hosts, check_runs, statuses, checks):
     github, _ = hosts
-    data = {"state": "OPEN", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"}
-    data["statusCheckRollup"] = rollup
-    shim.respond({"cli": "gh", "stdout": json.dumps(data)})
+    shim.respond(*gh_pull_rules(check_runs=check_runs, statuses=statuses))
     assert github.poll(12)["checks"] == checks
 
 
 @pytest.mark.parametrize(
-    "mergeable,status,expected",
+    "mergeable,state,expected,detail",
     [
-        ("MERGEABLE", "CLEAN", "mergeable"),
-        ("CONFLICTING", "CLEAN", "conflict"),
-        ("MERGEABLE", "DIRTY", "conflict"),
-        ("MERGEABLE", "CONFLICTING", "conflict"),
-        ("UNKNOWN", "UNKNOWN", "unknown"),
-        ("MERGEABLE", "BLOCKED", "blocked"),
-        ("MERGEABLE", "BEHIND", "blocked"),
-        (None, None, "blocked"),
+        (True, "clean", "mergeable", "CLEAN"),
+        (False, "clean", "conflict", "CLEAN"),
+        (True, "dirty", "conflict", "DIRTY"),
+        (False, "dirty", "conflict", "DIRTY"),
+        (None, "unknown", "unknown", "UNKNOWN"),
+        (None, None, "unknown", "UNKNOWN"),
+        (True, "blocked", "blocked", "BLOCKED"),
+        (True, "behind", "blocked", "BEHIND"),
+        (True, "unstable", "blocked", "UNSTABLE"),
     ],
 )
-def test_poll_github_mergeability(shim, hosts, mergeable, status, expected):
+def test_poll_github_mergeability(shim, hosts, mergeable, state, expected, detail):
     github, _ = hosts
-    data = {"state": "OPEN", "url": "u", "statusCheckRollup": []}
-    if mergeable is not None:
-        data["mergeable"] = mergeable
-    if status is not None:
-        data["mergeStateStatus"] = status
-    shim.respond({"cli": "gh", "stdout": json.dumps(data)})
+    pull = _rest_pull(mergeable=mergeable, mergeable_state=state)
+    shim.respond(*gh_pull_rules(pull))
     poll = github.poll(12)
     assert poll["mergeable"] == expected
-    assert poll["merge_detail"] == f"mergeStateStatus={status or 'UNKNOWN'}"
+    assert poll["merge_detail"] == f"mergeStateStatus={detail}"
 
 
 def test_poll_github_normalizes(shim, hosts):
     github, _ = hosts
-    rollup = [_ok(), _ok("FAILURE", name="build")]
-    data = {
-        "state": "OPEN",
-        "mergeable": "MERGEABLE",
-        "mergeStateStatus": "BLOCKED",
-        "url": "https://github.com/acme/app/pull/12",
-        "headRefOid": "abc123",
-        "statusCheckRollup": rollup,
-    }
+    runs = [
+        _rest_check(name="lint"),
+        _rest_check(
+            "failure", name="build", url="https://github.com/acme/app/actions/runs/5/job/1"
+        ),
+    ]
+    statuses = [{"context": "ext/ci", "state": "success", "target_url": "https://ci.example/1"}]
+    pull = _rest_pull(mergeable_state="blocked")
     threads = {"data": {"repository": {"pullRequest": {"reviewThreads": {
         "pageInfo": {"hasNextPage": False, "endCursor": None},
         "nodes": [{"isResolved": True}],
     }}}}}  # fmt: skip
     shim.respond(
-        {"cli": "gh", "match": ["pr", "view", "12"], "stdout": json.dumps(data)},
+        *gh_pull_rules(pull, runs, statuses),
         {"cli": "gh", "match": ["api", "graphql"], "stdout": json.dumps(threads)},
     )
-    assert github.poll(12) == {
+    rollup = [
+        {
+            "name": "lint",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "detailsUrl": None,
+        },
+        {
+            "name": "build",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+            "detailsUrl": "https://github.com/acme/app/actions/runs/5/job/1",
+        },
+        {"name": "ext/ci", "state": "SUCCESS", "detailsUrl": "https://ci.example/1"},
+    ]
+    poll = github.poll(12)
+    assert poll == {
         "state": "OPEN",
         "checks": "failed",
         "mergeable": "blocked",
         "merge_detail": "mergeStateStatus=BLOCKED",
         "url": "https://github.com/acme/app/pull/12",
         "head_sha": "abc123",
-        "raw": data,
+        "raw": poll["raw"],
         "reviews": 0,
     }
-    call = shim.calls()[0]
-    assert call["argv"] == [
-        "pr",
-        "view",
-        "12",
-        "--json",
-        "state,mergeable,mergeStateStatus,url,statusCheckRollup,headRefOid",
-        "-R",
-        "acme/app",
+    assert poll["raw"]["statusCheckRollup"] == rollup
+    assert [c["argv"] for c in shim.calls()[:3]] == [
+        ["api", f"{GH}/pulls/12"],
+        ["api", "--paginate", "--slurp", f"{GH}/commits/abc123/check-runs?per_page=100"],
+        ["api", f"{GH}/commits/abc123/status?per_page=100"],
     ]
 
 
-@pytest.mark.parametrize("state", ["OPEN", "MERGED", "CLOSED"])
-def test_poll_github_state_passes_through(shim, hosts, state):
+def test_poll_github_check_run_without_details_url_falls_back_to_html_url(shim, hosts):
     github, _ = hosts
-    shim.respond({"cli": "gh", "stdout": json.dumps({"state": state})})
+    run = {"name": "a", "status": "completed", "conclusion": "failure", "html_url": "https://h/1"}
+    shim.respond(*gh_pull_rules(check_runs=[run]))
+    entry = github.poll(12)["raw"]["statusCheckRollup"][0]
+    assert entry["detailsUrl"] == "https://h/1"
+
+
+def test_poll_github_check_runs_paginate(shim, hosts):
+    github, _ = hosts
+    rules = gh_pull_rules()
+    rules[1]["stdout"] = json.dumps(
+        [
+            {"check_runs": [_rest_check(name="a")]},
+            {"check_runs": [_rest_check("failure", name="b")]},
+        ]
+    )
+    shim.respond(*rules)
+    poll = github.poll(12)
+    assert [e["name"] for e in poll["raw"]["statusCheckRollup"]] == ["a", "b"]
+    assert poll["checks"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "pull,state",
+    [
+        ({"state": "open"}, "OPEN"),
+        ({"state": "closed", "merged": True, "merged_at": "2026-10-01T00:00:00Z"}, "MERGED"),
+        ({"state": "closed", "merged_at": "2026-10-01T00:00:00Z"}, "MERGED"),
+        ({"state": "closed", "merged": False, "merged_at": None}, "CLOSED"),
+    ],
+)
+def test_poll_github_state_from_rest(shim, hosts, pull, state):
+    github, _ = hosts
+    shim.respond({"cli": "gh", "stdout": json.dumps(pull)})
     poll = github.poll(1)
     assert poll["state"] == state
     assert (poll["url"], poll["head_sha"], poll["checks"]) == ("", "", "none")
@@ -340,15 +459,37 @@ def test_poll_gitlab_normalizes(shim, hosts):
 # --- failed_reasons ---------------------------------------------------------
 
 
+def _rest_rollup(rollup):
+    """(check_runs, statuses) REST lists for a flat check list: entries with a
+    `state` are commit statuses, the rest check runs."""
+    runs, statuses = [], []
+    for e in rollup:
+        if "state" in e:
+            statuses.append(
+                {
+                    "context": e.get("context"),
+                    "state": e["state"].lower(),
+                    "target_url": e.get("detailsUrl"),
+                }
+            )
+        else:
+            runs.append(
+                {
+                    "name": e.get("name"),
+                    "status": e["status"].lower(),
+                    "conclusion": e["conclusion"].lower(),
+                    "details_url": e.get("detailsUrl"),
+                }
+            )
+    return runs, statuses
+
+
 def _gh_failed_poll(github, shim, rollup):
+    runs, statuses = _rest_rollup(rollup)
     shim.respond(
         {"cli": "gh", "match": ["run", "view", "555"], "stdout": LOG_150},
         {"cli": "gh", "match": ["run", "view", "666"], "stderr": "log gone", "exit": 1},
-        {
-            "cli": "gh",
-            "match": ["pr", "view"],
-            "stdout": json.dumps({"state": "OPEN", "statusCheckRollup": rollup}),
-        },
+        *gh_pull_rules(check_runs=runs, statuses=statuses),
     )
     return github.poll(12)
 
@@ -412,20 +553,10 @@ def test_failed_reasons_log_tails_both_hosts(shim, hosts):
 
 def test_failed_reasons_short_log_kept_whole(shim, hosts):
     github, _ = hosts
+    runs, _ = _rest_rollup([_ok("FAILURE", name="b", detailsUrl="/actions/runs/1/job/2")])
     shim.respond(
         {"cli": "gh", "match": ["run", "view"], "stdout": "a\nb\n"},
-        {
-            "cli": "gh",
-            "match": ["pr", "view"],
-            "stdout": json.dumps(
-                {
-                    "state": "OPEN",
-                    "statusCheckRollup": [
-                        _ok("FAILURE", name="b", detailsUrl="/actions/runs/1/job/2")
-                    ],
-                }
-            ),
-        },
+        *gh_pull_rules(check_runs=runs),
     )
     assert github.failed_reasons(github.poll(12)) == ["check 'b' failed:\na\nb"]
 
@@ -441,9 +572,10 @@ def test_failed_reasons_github_degrades_per_check(shim, hosts):
     poll = _gh_failed_poll(github, shim, rollup)
     assert github.failed_reasons(poll) == [
         "check 'no-url' failed:\nno run id found (detailsUrl=none)",
-        "check 'unknown check' failed:\nno run id found (detailsUrl=https://ci.example/1)",
         "check 'gone' failed:\ncould not fetch log for run 666: log gone",
         "check 'unknown check' failed:\nno run id found (detailsUrl=none)",
+        # commit statuses follow the check runs in the synthesised rollup
+        "check 'ext/ci' failed:\nno run id found (detailsUrl=https://ci.example/1)",
     ]
 
 
@@ -480,10 +612,15 @@ def test_failed_reasons_empty_unless_checks_failed(shim, hosts):
 
 def test_conflict_files(shim, hosts):
     github, gitlab = hosts
-    files = {"files": [{"path": "a.py"}, {"path": "b/c.md"}, {"additions": 1}]}
-    shim.respond({"cli": "gh", "stdout": json.dumps(files)})
-    assert github.conflict_files(12) == ["a.py", "b/c.md"]
-    assert shim.calls()[-1]["argv"] == ["pr", "view", "12", "--json", "files", "-R", "acme/app"]
+    pages = [[{"filename": "a.py"}, {"filename": "b/c.md"}], [{"filename": "d.txt"}, {"sha": "x"}]]
+    shim.respond({"cli": "gh", "stdout": json.dumps(pages)})
+    assert github.conflict_files(12) == ["a.py", "b/c.md", "d.txt"]
+    assert shim.calls()[-1]["argv"] == [
+        "api",
+        "--paginate",
+        "--slurp",
+        f"{GH}/pulls/12/files?per_page=100",
+    ]
     before = len(shim.calls())
     assert gitlab.conflict_files(7) == []
     assert len(shim.calls()) == before
@@ -498,30 +635,86 @@ def test_conflict_files_github_error_is_empty(shim, hosts):
 # --- list_open --------------------------------------------------------------
 
 
-def test_list_open_both_hosts(shim, hosts):
-    github, gitlab = hosts
-    prs = [
+def _gh_list_rules(prs):
+    """gh rules for list_open: the open list, then each PR's detail and checks.
+    prs: [(number, created_at, extra pull fields, check_runs)]"""
+    listing = [{"number": n, "created_at": created} for n, created, _, _ in prs]
+    rules = []
+    for n, created, extra, runs in prs:
+        pull = _rest_pull(n, sha=f"sha{n}", created_at=created, **extra)
+        rules += gh_pull_rules(pull, check_runs=runs, num=n)
+    return [
         {
-            "number": 3,
-            "url": "https://github.com/acme/app/pull/3",
-            "title": "newer",
-            "body": "fix it",
-            "createdAt": "2026-10-03T00:00:00Z",
-            "mergeable": "CONFLICTING",
-            "mergeStateStatus": "DIRTY",
-            "statusCheckRollup": [],
+            "cli": "gh",
+            "match": [f"{GH}/pulls?state=open&per_page=100"],
+            "stdout": json.dumps([listing]),
         },
+        *rules,
+    ]
+
+
+def test_list_open_github(shim, hosts):
+    github, _ = hosts
+    shim.respond(
+        *_gh_list_rules(
+            [
+                (
+                    3,
+                    "2026-10-03T00:00:00Z",
+                    {
+                        "title": "newer",
+                        "body": "fix it",
+                        "mergeable": False,
+                        "mergeable_state": "dirty",
+                    },
+                    [],
+                ),
+                (
+                    1,
+                    "2026-10-01T00:00:00Z",
+                    {"title": "older", "body": None},
+                    [_rest_check("failure")],
+                ),
+            ]
+        )
+    )
+    items = github.list_open()
+    assert [i.pop("raw")["number"] for i in items] == [1, 3]
+    assert items == [
         {
-            "number": 1,
+            "n": 1,
             "url": "https://github.com/acme/app/pull/1",
             "title": "older",
             "body": "",
-            "createdAt": "2026-10-01T00:00:00Z",
-            "mergeable": "MERGEABLE",
-            "mergeStateStatus": "CLEAN",
-            "statusCheckRollup": [_ok("FAILURE")],
+            "created": "2026-10-01T00:00:00Z",
+            "checks": "failed",
+            "mergeable": "mergeable",
+        },
+        {
+            "n": 3,
+            "url": "https://github.com/acme/app/pull/3",
+            "title": "newer",
+            "body": "fix it",
+            "created": "2026-10-03T00:00:00Z",
+            "checks": "none",
+            "mergeable": "conflict",
         },
     ]
+    argvs = [c["argv"] for c in shim.calls()]
+    assert argvs[0] == ["api", "--paginate", "--slurp", f"{GH}/pulls?state=open&per_page=100"]
+    assert ["api", f"{GH}/pulls/3"] in argvs and ["api", f"{GH}/pulls/1"] in argvs
+
+
+def test_list_open_github_raw_is_the_synthesised_view(shim, hosts):
+    github, _ = hosts
+    shim.respond(*_gh_list_rules([(1, "2026-10-01T00:00:00Z", {}, [_rest_check()])]))
+    raw = github.list_open()[0]["raw"]
+    assert raw["mergeable"] == "MERGEABLE" and raw["mergeStateStatus"] == "CLEAN"
+    assert raw["statusCheckRollup"][0]["conclusion"] == "SUCCESS"
+
+
+def test_list_open_gitlab(shim, hosts):
+    _, gitlab = hosts
     mrs = [
         {
             "iid": 4,
@@ -543,32 +736,7 @@ def test_list_open_both_hosts(shim, hosts):
             "has_conflicts": True,
         },
     ]
-    shim.respond(
-        {"cli": "gh", "stdout": json.dumps(prs)},
-        {"cli": "glab", "stdout": json.dumps(mrs)},
-    )
-    assert github.list_open() == [
-        {
-            "n": 1,
-            "url": "https://github.com/acme/app/pull/1",
-            "title": "older",
-            "body": "",
-            "created": "2026-10-01T00:00:00Z",
-            "checks": "failed",
-            "mergeable": "mergeable",
-            "raw": prs[1],
-        },
-        {
-            "n": 3,
-            "url": "https://github.com/acme/app/pull/3",
-            "title": "newer",
-            "body": "fix it",
-            "created": "2026-10-03T00:00:00Z",
-            "checks": "none",
-            "mergeable": "conflict",
-            "raw": prs[0],
-        },
-    ]
+    shim.respond({"cli": "glab", "stdout": json.dumps(mrs)})
     assert gitlab.list_open() == [
         {
             "n": 4,
@@ -591,20 +759,7 @@ def test_list_open_both_hosts(shim, hosts):
             "raw": mrs[1],
         },
     ]
-    gh_call, gl_call = shim.calls()
-    assert gh_call["argv"][:4] == ["pr", "list", "--state", "open"]
-    fields = gh_call["argv"][gh_call["argv"].index("--json") + 1].split(",")
-    assert set(fields) >= {
-        "number",
-        "url",
-        "title",
-        "body",
-        "createdAt",
-        "mergeable",
-        "statusCheckRollup",
-    }
-    assert gh_call["argv"][-2:] == ["-R", "acme/app"]
-    assert gl_call["argv"] == [
+    assert shim.calls()[0]["argv"] == [
         "api",
         f"{GL_MR}?state=opened&order_by=created_at&sort=asc&per_page=100",
     ]
@@ -612,14 +767,135 @@ def test_list_open_both_hosts(shim, hosts):
 
 def test_list_open_empty_both_hosts(shim, hosts):
     github, gitlab = hosts
-    shim.respond({"cli": "gh", "stdout": "[]"}, {"cli": "glab", "stdout": "null"})
+    shim.respond({"cli": "gh", "stdout": "[[]]"}, {"cli": "glab", "stdout": "null"})
     assert github.list_open() == []
     assert gitlab.list_open() == []
 
 
-def test_list_open_github_lists_more_than_the_default_page(shim, hosts):
-    github, _ = hosts
-    shim.respond({"cli": "gh", "stdout": "[]"})
-    github.list_open()
-    argv = shim.calls()[0]["argv"]
-    assert int(argv[argv.index("--limit") + 1]) >= 100
+# --- no GraphQL-backed gh subcommand, cloud or local -------------------------------
+
+
+def _gh_world_rules():
+    pull = _rest_pull(12, merged=True, merge_commit_sha="m" * 40, state="closed")
+    return [
+        {"cli": "gh", "match": [f"{GH}/pulls/12/files?per_page=100"], "stdout": "[[]]"},
+        {
+            "cli": "gh",
+            "match": [f"{GH}/pulls?state=open&per_page=100"],
+            "stdout": json.dumps([[{"number": 12, "created_at": "x"}]]),
+        },
+        {
+            "cli": "gh",
+            "match": [f"{GH}/pulls?state=open&head=acme:b"],
+            "stdout": json.dumps([{"number": 12, "html_url": "u"}]),
+        },
+        {"cli": "gh", "match": [f"{GH}/pulls?head=acme:b&state=all"], "stdout": "[]"},
+        {"cli": "gh", "match": [f"{GH}/issues/12/labels?per_page=100"], "stdout": "[[]]"},
+        {"cli": "gh", "match": [f"{GH}"], "stdout": json.dumps({"default_branch": "main"})},
+        {"cli": "gh", "match": ["POST", f"{GH}/pulls"], "stdout": json.dumps({"html_url": "u"})},
+        {"cli": "gh", "match": [f"{GH}/pulls/12/ccr/review_threads"], "stdout": "[]"},
+        *gh_pull_rules(pull, num=12),
+        {"cli": "gh", "match": ["--slurp"], "stdout": "[[]]"},
+    ]
+
+
+@pytest.mark.parametrize("remote", ["", "true"])
+def test_github_never_issues_graphql_backed_subcommands(shim, remote):
+    """Retirement pin: `gh pr ...`, `gh repo view` and `gh label ...` are GraphQL on the
+    wire, which Claude Code cloud sessions answer with HTTP 403. Every GitHub op is a
+    `gh api` REST call (or `gh run`); only the local review-thread count posts graphql."""
+    shim.respond(*_gh_world_rules())
+    env = {**os.environ, "CLAUDE_CODE_REMOTE": remote}
+    gh = scm.GitHub("app", "github.com", "acme/app", env=env)
+    ops = [
+        lambda: gh.find_open("b"),
+        lambda: gh.create("b", "t", "x"),
+        lambda: gh.edit_body(12, "x"),
+        lambda: gh.semver_label(12),
+        lambda: gh.ensure_label("patch"),
+        lambda: gh.apply_label(12, "patch"),
+        lambda: gh.resolve_branch("b"),
+        lambda: gh.poll(12),
+        lambda: gh.unresolved_reviews(12),
+        lambda: gh.resolve_deploy(12),
+        lambda: gh.default_branch(),
+        lambda: gh.conflict_files(12),
+        lambda: gh.list_open(),
+    ]
+    for op in ops:
+        try:
+            op()
+        except common.RepoError:
+            pass  # resolve_branch has no PR in this world; only the argv matters here
+    argvs = [c["argv"] for c in shim.calls()]
+    assert len(argvs) >= len(ops)
+    for argv in argvs:
+        assert argv[0] in ("api", "run"), argv
+        if remote:
+            assert "graphql" not in argv, argv
+
+
+# --- unresolved_reviews in a cloud session: the proxy's REST route --------------
+
+CCR = f"{GH}/pulls/12/ccr/review_threads"
+
+
+def _cloud_github(env=None):
+    return scm.GitHub("app", "github.com", "acme/app", env=env)
+
+
+@pytest.mark.parametrize(
+    "answer,count",
+    [
+        ([], 0),
+        ([{"isResolved": False}, {"isResolved": True}, {"isResolved": False}], 2),
+        ([{"is_resolved": True}, {"is_resolved": False}], 1),
+        ([{"resolved": True}, {"resolved": False}, {}], 2),
+        ({"threads": [{"isResolved": False}, {"isResolved": True}]}, 1),
+        ({"review_threads": [{"is_resolved": False}]}, 1),
+        ({"reviewThreads": {"nodes": [{"isResolved": False}, {"isResolved": False}]}}, 2),
+        ({"nodes": [{"isResolved": True}]}, 0),
+    ],
+)
+def test_unresolved_reviews_cloud_counts_unresolved_threads(shim, monkeypatch, answer, count):
+    monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")  # the adapter reads os.environ by default
+    shim.respond({"cli": "gh", "match": [CCR], "stdout": json.dumps(answer)})
+    assert _cloud_github().unresolved_reviews(12) == count
+    assert [c["argv"] for c in shim.calls()] == [["api", CCR]]
+
+
+def test_unresolved_reviews_cloud_flag_comes_from_the_adapter_env(shim):
+    shim.respond({"cli": "gh", "match": [CCR], "stdout": json.dumps([{"isResolved": False}])})
+    env = {**os.environ, "CLAUDE_CODE_REMOTE": "true"}
+    assert _cloud_github(env).unresolved_reviews(12) == 1
+    # an explicit env without the flag stays on graphql, whatever os.environ says
+    local = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_REMOTE"}
+    shim.respond({"cli": "gh", "match": ["graphql"], "stdout": json.dumps({"data": None})})
+    with pytest.raises(common.RepoError, match="unexpected reviewThreads"):
+        _cloud_github(local).unresolved_reviews(12)
+    assert "graphql" in shim.calls()[-1]["argv"]
+
+
+@pytest.mark.parametrize("answer", ['{"error": "x"}', '"text"', "[1, 2]", "null"])
+def test_unresolved_reviews_cloud_unexpected_shape_raises(shim, monkeypatch, answer):
+    monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+    shim.respond({"cli": "gh", "match": [CCR], "stdout": answer})
+    with pytest.raises(common.RepoError, match="unexpected review_threads response"):
+        _cloud_github().unresolved_reviews(12)
+
+
+def test_unresolved_reviews_cloud_http_error_raises(shim, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+    shim.respond({"cli": "gh", "stderr": "gh: Not Found (HTTP 404)", "exit": 1})
+    with pytest.raises(common.RepoError, match="404"):
+        _cloud_github().unresolved_reviews(12)
+
+
+def test_poll_cloud_carries_reviews_without_graphql(shim, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+    shim.respond(
+        {"cli": "gh", "match": [CCR], "stdout": json.dumps([{"isResolved": False}])},
+        *gh_pull_rules(),
+    )
+    assert _cloud_github().poll(12)["reviews"] == 1
+    assert all("graphql" not in c["argv"] for c in shim.calls())

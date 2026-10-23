@@ -49,6 +49,11 @@ macOS, Linux and WSL. Native Windows is not supported; use WSL.
 3. Run `claude` at the repo root and accept the trust dialog. Project settings
    then load the workbench plugin from the root marketplace.
 4. If the plugin is not listed, run `/reload-plugins`.
+
+   In a Claude Code cloud session (claude.ai/code, the Claude app, `claude --cloud`) there is
+   no trust dialog and no `/reload-plugins`; a SessionStart hook installs the plugins and the
+   tools instead. Set the cloud environment up once with
+   [docs/claude-cloud.md](docs/claude-cloud.md).
 5. Ask, in plain words:
    - "start a new project called X ..." or
    - "adopt the repos at /path/a /path/b ..."
@@ -88,7 +93,7 @@ agent to run init first.
 | `plugins/` | the core plugin and the packs |
 | `.claude-plugin/marketplace.json` | root marketplace listing the plugins |
 | `.claude/` | project settings and `rules/` |
-| `docs/` | plans, research, handoffs, architecture, harnesses, enterprise |
+| `docs/` | plans, research, handoffs, architecture, harnesses, enterprise, claude-cloud |
 | `scripts/` | init engine, harness generators, doctor, lint checks |
 | `mise-tasks/` | the `mise run ...` tasks |
 | `.github/workflows/` | CI |
@@ -287,6 +292,12 @@ harness's directory; that is a repo-wide choice committed for the whole team. Te
 harnesses run `mise run harness-setup -- <their target> --no-migrate` to generate their files
 without migrating, and `mise run harness-setup -- claude` switches back.
 
+
+## Claude Code cloud
+
+Cloud sessions need a one-time environment setup and a single-repository session; pushing to
+component submodules needs each component repo attached with `add_repo`. The runbook covers
+setup, verification and troubleshooting: [docs/claude-cloud.md](docs/claude-cloud.md).
 
 ## Enterprise
 

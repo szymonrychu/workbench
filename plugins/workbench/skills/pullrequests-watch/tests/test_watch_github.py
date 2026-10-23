@@ -11,8 +11,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_lib" / "tests"))
 
 import common  # noqa: E402
+import fake_gh_rest  # noqa: E402
 import scm  # noqa: E402
 import watch  # noqa: E402
 
@@ -25,11 +27,15 @@ def _gh(repo="repo1", slug="acme/repo1"):
     return scm.GitHub(repo, "github.com", slug)
 
 
-GH_SHIM = textwrap.dedent(
-    """\
+GH_SHIM = fake_gh_rest.shim(
+    textwrap.dedent(
+        """\
     #!/usr/bin/env python3
     import json
     import sys
+
+    sys.path.insert(0, "__FAKE_GH_DIR__")
+    import fake_gh_rest
 
     BRANCHES = {"feature-x": "201"}
 
@@ -93,27 +99,25 @@ GH_SHIM = textwrap.dedent(
         },
     }
 
-    FILES = {"203": [{"path": "a.py"}, {"path": "b.py"}]}
+    FILES = {"203": ["a.py", "b.py"]}
 
     LOGS = {"9002": "\\n".join(f"log line {i}" for i in range(1, 151))}
+
+    WORLD = {
+        "slug": "acme/repo1",
+        "default_branch": "main",
+        "prs": PRS,
+        "branches": BRANCHES,
+        "files": FILES,
+    }
 
 
     def main():
         argv = sys.argv[1:]
-        if argv[0] == "pr" and argv[1] == "view":
-            selector = argv[2]
-            num = BRANCHES.get(selector, selector)
-            json_idx = argv.index("--json")
-            fields = argv[json_idx + 1].split(",")
-            if num not in PRS:
-                sys.stderr.write("GraphQL: could not resolve to a PullRequest\\n")
-                sys.exit(1)
-            if fields == ["files"]:
-                print(json.dumps({"files": FILES.get(num, [])}))
-                return
-            data = PRS[num]
-            print(json.dumps({k: data[k] for k in fields if k in data}))
-            return
+        if argv[0] == "api":
+            code = fake_gh_rest.serve(argv, WORLD)
+            if code is not None:
+                sys.exit(code)
         if argv[0] == "run" and argv[1] == "view":
             run_id = argv[2]
             if "--log-failed" in argv:
@@ -128,6 +132,7 @@ GH_SHIM = textwrap.dedent(
     if __name__ == "__main__":
         main()
     """
+    )
 )
 
 # The GitLab side of the mixed-host runs: branch feature-x has MR !201, green.
@@ -509,12 +514,17 @@ def test_now_and_sleep_are_indirections():
     assert callable(watch._sleep)
 
 
-GH_WATCH_SHIM = textwrap.dedent(
-    """\
+GH_WATCH_SHIM = fake_gh_rest.shim(
+    textwrap.dedent(
+        """\
     #!/usr/bin/env python3
     import json
     import pathlib
+    import re
     import sys
+
+    sys.path.insert(0, "__FAKE_GH_DIR__")
+    import fake_gh_rest
 
     COUNTER = pathlib.Path(__file__).with_name("calls.txt")
 
@@ -551,24 +561,25 @@ GH_WATCH_SHIM = textwrap.dedent(
 
     def main():
         argv = sys.argv[1:]
-        if argv[0] == "pr" and argv[1] == "view":
-            num = argv[2]
-            json_idx = argv.index("--json")
-            fields = argv[json_idx + 1].split(",")
-            if fields == ["files"]:
-                print(json.dumps({"files": []}))
-                return
-            tick = _tick()
-            data = {
-                "state": "OPEN",
-                "mergeable": "MERGEABLE",
-                "mergeStateStatus": "CLEAN",
-                "url": f"https://github.com/acme/repo1/pull/{num}",
-                "statusCheckRollup": rollup_for(num, tick),
-                "number": int(num),
+        if argv[0] == "api":
+            path = fake_gh_rest.parse(argv)[1]
+            if re.fullmatch(r"repos/acme/repo1/pulls/\\d+", path):
+                tick = _tick()  # one poll = the pull read, then its checks at the same tick
+            else:
+                tick = int(COUNTER.read_text()) - 1 if COUNTER.exists() else 0
+            prs = {
+                num: {
+                    "state": "OPEN",
+                    "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                    "url": f"https://github.com/acme/repo1/pull/{num}",
+                    "statusCheckRollup": rollup_for(num, tick),
+                }
+                for num in ("301", "302", "303", "304")
             }
-            print(json.dumps({k: data[k] for k in fields if k in data}))
-            return
+            code = fake_gh_rest.serve(argv, {"slug": "acme/repo1", "prs": prs})
+            if code is not None:
+                sys.exit(code)
         if argv[0] == "run" and argv[1] == "view":
             run_id = argv[2]
             if "--log-failed" in argv:
@@ -582,6 +593,7 @@ GH_WATCH_SHIM = textwrap.dedent(
     if __name__ == "__main__":
         main()
     """
+    )
 )
 
 
@@ -686,12 +698,17 @@ def test_resolved_line_shape_github(fake_clock, gh_watch_shim, capsys):
 # independently, unlike gh_watch_shim's single shared counter which only
 # works for a single-target call)
 
-GH_WATCH_SHIM_PER_TARGET = textwrap.dedent(
-    """\
+GH_WATCH_SHIM_PER_TARGET = fake_gh_rest.shim(
+    textwrap.dedent(
+        """\
     #!/usr/bin/env python3
     import json
     import pathlib
+    import re
     import sys
+
+    sys.path.insert(0, "__FAKE_GH_DIR__")
+    import fake_gh_rest
 
     COUNTS_FILE = pathlib.Path(__file__).with_name("calls.json")
 
@@ -713,29 +730,32 @@ GH_WATCH_SHIM_PER_TARGET = textwrap.dedent(
 
     def main():
         argv = sys.argv[1:]
-        if argv[0] == "pr" and argv[1] == "view":
-            num = argv[2]
-            json_idx = argv.index("--json")
-            fields = argv[json_idx + 1].split(",")
-            if fields == ["files"]:
-                print(json.dumps({"files": []}))
-                return
-            tick = _tick(num)
-            data = {
-                "state": "OPEN",
-                "mergeable": "MERGEABLE",
-                "mergeStateStatus": "CLEAN",
-                "url": f"https://github.com/acme/repo/pull/{num}",
-                "statusCheckRollup": rollup_for(num, tick),
-                "number": int(num),
+        if argv[0] == "api":
+            path = fake_gh_rest.parse(argv)[1]
+            m = re.fullmatch(r"repos/acme/(repo[12])/pulls/(\\d+)", path)
+            if m:
+                _tick(m.group(2))  # the pull read starts a poll; its checks reuse the tick
+            counts = json.loads(COUNTS_FILE.read_text()) if COUNTS_FILE.exists() else {}
+            prs = {
+                num: {
+                    "state": "OPEN",
+                    "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                    "url": f"https://github.com/acme/repo/pull/{num}",
+                    "statusCheckRollup": rollup_for(num, counts.get(num, 1) - 1),
+                }
+                for num in ("401", "402")
             }
-            print(json.dumps({k: data[k] for k in fields if k in data}))
-            return
+            slug = "acme/repo1" if "/repo1/" in path else "acme/repo2"
+            code = fake_gh_rest.serve(argv, {"slug": slug, "prs": prs})
+            if code is not None:
+                sys.exit(code)
         sys.stderr.write(f"unhandled gh args: {argv}\\n")
         sys.exit(1)
     if __name__ == "__main__":
         main()
     """
+    )
 )
 
 

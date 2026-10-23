@@ -49,11 +49,12 @@ glab ci list --branch <branch>
 glab ci trace <job-id> 2>&1 | tail -n 120
 ```
 
-GitHub:
+GitHub (REST only: `gh pr ...`, `gh repo view --json` and `gh label list` use GraphQL,
+which Claude Code cloud sessions block with HTTP 403):
 ```bash
-gh pr list --author @me
-gh pr view <id>
-gh pr checks <id>
+gh api 'repos/{owner}/{repo}/pulls?state=open'
+gh api repos/{owner}/{repo}/pulls/<id>
+gh api repos/{owner}/{repo}/commits/<head-sha>/check-runs
 gh run list --branch <branch>
 gh run view <run-id> --log-failed 2>&1 | tail -n 120
 ```

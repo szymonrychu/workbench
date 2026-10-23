@@ -46,6 +46,8 @@ CHECK_FAILURE_CONCLUSIONS = frozenset(
 )
 CHECK_FAILURE_STATES = frozenset({"FAILURE", "ERROR"})
 _RUN_ID = re.compile(r"/actions/runs/(\d+)")
+# Keys a ccr review_threads entry may use for "this thread is resolved".
+_RESOLVED_KEYS = ("isResolved", "is_resolved", "resolved")
 
 # GitLab head pipeline statuses; anything else is pending.
 PIPELINE_PASSED_STATUSES = frozenset({"success", "skipped"})
@@ -387,20 +389,57 @@ class GitHub(Adapter):
             return args[:2] + [self.target] + args[2:]
         return _insert_before_dashdash(args, ["-R", self.target])
 
+    # Every call below is `gh api` REST, never a `gh pr|repo|label` subcommand: those
+    # are GraphQL on the wire, which the Claude Code cloud egress proxy answers with 403.
+
+    @property
+    def remote(self) -> bool:
+        """True inside a Claude Code cloud session."""
+        return (os.environ if self._env is None else self._env).get("CLAUDE_CODE_REMOTE") == "true"
+
+    def pages(self, endpoint: str, key: str | None = None) -> list:
+        """Every item of a paginated REST list (under `key` for an object page)."""
+        items: list = []
+        for page in self.json(["api", "--paginate", "--slurp", endpoint]):
+            items.extend(page.get(key, []) if key else page)
+        return items
+
+    def _write(self, method: str, endpoint: str, **fields: str | list[str]) -> dict:
+        """A REST write; each field is a string parameter (`name[]` for a list value)."""
+        args = ["api", "-X", method, endpoint]
+        for name, value in fields.items():
+            if isinstance(value, str):
+                args += ["-f", f"{name}={value}"]
+            else:
+                args += [arg for item in value for arg in ("-f", f"{name}[]={item}")]
+        stdout = self.run(args).stdout
+        try:
+            return json.loads(stdout) if stdout.strip() else {}
+        except json.JSONDecodeError as e:
+            raise common.RepoError(f"gh api {method} {endpoint}: non-JSON output") from e
+
     def find_open(self, branch: str) -> tuple[int, str] | None:
-        prs = self.json(["pr", "list", "--head", branch, "--json", "number,url"])
-        return (prs[0]["number"], prs[0]["url"]) if prs else None
+        prs = self.json(["api", f"repos/{self.slug}/pulls?state=open&head={self._head(branch)}"])
+        return (prs[0]["number"], prs[0]["html_url"]) if prs else None
 
     def create(self, branch: str, title: str, body: str) -> str:
-        result = self.run(["pr", "create", "--head", branch, "--title", title, "--body", body])
-        return result.stdout.strip()
+        created = self._write(
+            "POST",
+            f"repos/{self.slug}/pulls",
+            head=branch,
+            base=self.default_branch(),
+            title=title,
+            body=body,
+        )
+        if not created.get("html_url"):
+            raise common.RepoError(f"branch {branch}: PR created but the answer has no html_url")
+        return created["html_url"]
 
     def edit_body(self, n, body: str) -> None:
-        self.run(["pr", "edit", str(n), "--body", body])
+        self._write("PATCH", f"repos/{self.slug}/pulls/{n}", body=body)
 
     def semver_label(self, n) -> str | None:
-        data = self.json(["pr", "view", str(n), "--json", "labels"])
-        for label in data.get("labels", []):
+        for label in self.pages(f"repos/{self.slug}/issues/{n}/labels?per_page=100"):
             name = label.get("name", "")
             if name.startswith("semver:"):
                 return name[len("semver:") :]
@@ -408,12 +447,17 @@ class GitHub(Adapter):
 
     def ensure_label(self, level: str) -> None:
         _check_level(level)
-        self.run(
-            ["label", "create", f"semver:{level}", "--color", SEMVER_LABEL_COLORS[level], "--force"]
-        )
+        name, color = f"semver:{level}", SEMVER_LABEL_COLORS[level]
+        try:
+            self._write("POST", f"repos/{self.slug}/labels", name=name, color=color)
+        except CLIError as e:
+            if "422" not in e.stderr and "already_exists" not in e.stderr:
+                raise
+            # The label exists: recolour it, as `gh label create --force` did.
+            self._write("PATCH", f"repos/{self.slug}/labels/{quote(name, safe='')}", color=color)
 
     def apply_label(self, n, level: str) -> None:
-        self.run(["pr", "edit", str(n), "--add-label", f"semver:{level}"])
+        self._write("POST", f"repos/{self.slug}/issues/{n}/labels", labels=[f"semver:{level}"])
 
     @staticmethod
     def reduce_checks(rollup) -> str:
@@ -449,15 +493,78 @@ class GitHub(Adapter):
             return "mergeable"
         return "blocked"
 
+    def _head(self, branch: str) -> str:
+        """The `owner:branch` REST head filter, url-encoded."""
+        return quote(f"{self.slug.partition('/')[0]}:{branch}", safe=":/")
+
     def resolve_branch(self, branch: str) -> int:
+        endpoint = f"repos/{self.slug}/pulls?head={self._head(branch)}"
         try:
-            return int(self.json(["pr", "view", branch, "--json", "number"])["number"])
+            pulls = self.json(
+                ["api", f"{endpoint}&state=all&sort=created&direction=desc&per_page=1"]
+            )
+            if not pulls:
+                raise common.RepoError("no pull request has this head branch")
+            return int(pulls[0]["number"])
         except (common.RepoError, KeyError, TypeError, ValueError) as e:
             raise common.RepoError(f"branch {branch}: no PR found ({e})") from e
 
+    @staticmethod
+    def pull_view(pull: dict) -> dict:
+        """The flat PR view (state OPEN|CLOSED|MERGED, mergeable MERGEABLE|CONFLICTING|
+        UNKNOWN, mergeStateStatus upper-cased, ...) of a REST pull object."""
+        if pull.get("merged") or pull.get("merged_at"):
+            state = "MERGED"
+        else:
+            state = {"open": "OPEN", "closed": "CLOSED"}.get(pull.get("state") or "", "UNKNOWN")
+        mergeable = pull.get("mergeable")
+        return {
+            "number": pull.get("number"),
+            "state": state,
+            "mergeable": "UNKNOWN"
+            if mergeable is None
+            else "MERGEABLE"
+            if mergeable
+            else "CONFLICTING",
+            "mergeStateStatus": (pull.get("mergeable_state") or "unknown").upper(),
+            "url": pull.get("html_url") or "",
+            "headRefOid": (pull.get("head") or {}).get("sha") or "",
+            "title": pull.get("title") or "",
+            "body": pull.get("body") or "",
+            "createdAt": pull.get("created_at") or "",
+        }
+
+    def check_rollup(self, sha: str) -> list[dict]:
+        """The commit's check runs, then its commit statuses, as one flat list."""
+        if not sha:
+            return []
+        base = f"repos/{self.slug}/commits/{sha}"
+        runs = self.pages(f"{base}/check-runs?per_page=100", "check_runs")
+        statuses = self.json(["api", f"{base}/status?per_page=100"]).get("statuses") or []
+        return [
+            {
+                "name": run.get("name"),
+                "status": (run.get("status") or "").upper(),
+                "conclusion": (run.get("conclusion") or "").upper() or None,
+                "detailsUrl": run.get("details_url") or run.get("html_url"),
+            }
+            for run in runs
+        ] + [
+            {
+                "name": status.get("context"),
+                "state": (status.get("state") or "").upper(),
+                "detailsUrl": status.get("target_url"),
+            }
+            for status in statuses
+        ]
+
+    def snapshot(self, pull: dict) -> dict:
+        """pull_view plus statusCheckRollup: the dict poll() and list_open() keep as raw."""
+        view = self.pull_view(pull)
+        return {**view, "statusCheckRollup": self.check_rollup(view["headRefOid"])}
+
     def poll(self, n) -> dict:
-        fields = "state,mergeable,mergeStateStatus,url,statusCheckRollup,headRefOid"
-        data = self.json(["pr", "view", str(n), "--json", fields])
+        data = self.snapshot(self.json(["api", f"repos/{self.slug}/pulls/{n}"]))
         merge_state_status = data.get("mergeStateStatus") or "UNKNOWN"
         poll = {
             "state": data.get("state") or "UNKNOWN",
@@ -477,9 +584,37 @@ class GitHub(Adapter):
                 pass
         return poll
 
+    @staticmethod
+    def _thread_entries(data) -> list:
+        """The thread list of a ccr review_threads answer: a bare list, or an object
+        holding one under threads/review_threads/reviewThreads/nodes (possibly as
+        {"nodes": [...]})."""
+        if isinstance(data, dict):
+            for key in ("threads", "review_threads", "reviewThreads", "nodes"):
+                found = data.get(key)
+                if isinstance(found, dict):
+                    found = found.get("nodes")
+                if isinstance(found, list):
+                    return found
+        elif isinstance(data, list):
+            return data
+        raise TypeError("no thread list")
+
+    def _unresolved_reviews_remote(self, n) -> int:
+        """Cloud sessions block graphql; the proxy serves the threads as REST."""
+        data = self.json(["api", f"repos/{self.slug}/pulls/{n}/ccr/review_threads"])
+        try:
+            threads = self._thread_entries(data)
+            return sum(not any(t.get(key) for key in _RESOLVED_KEYS) for t in threads)
+        except (AttributeError, TypeError) as e:
+            raise common.RepoError(f"PR {n}: unexpected review_threads response ({e})") from e
+
     def unresolved_reviews(self, n) -> int:
         """Unresolved review threads of PR n, outdated ones included (as GitLab
-        counts them). One graphql call; more only for threads past the first 100."""
+        counts them). Locally one graphql call, more only for threads past the first
+        100; in a Claude Code cloud session the proxy's REST review_threads route."""
+        if self.remote:
+            return self._unresolved_reviews_remote(n)
         owner, _, name = self.slug.partition("/")
         count, cursor = 0, None
         while True:
@@ -527,15 +662,14 @@ class GitHub(Adapter):
 
     def resolve_deploy(self, n) -> tuple[str, str]:
         """(base branch, merge commit sha) of merged PR n; an unmerged PR is an error."""
-        data = self.json(["pr", "view", str(n), "--json", "state,mergeCommit,baseRefName"])
-        sha = (data.get("mergeCommit") or {}).get("oid")
-        if data.get("state") != "MERGED" or not sha:
+        data = self.json(["api", f"repos/{self.slug}/pulls/{n}"])
+        sha = data.get("merge_commit_sha")
+        if not (data.get("merged") or data.get("merged_at")) or not sha:
             raise common.RepoError(f"pr #{n} not merged yet - deploy-watch is a post-merge action")
-        return data.get("baseRefName") or self.deploy_branch(), sha
+        return (data.get("base") or {}).get("ref") or self.deploy_branch(), sha
 
     def default_branch(self) -> str:
-        data = self.json(["repo", "view", "--json", "defaultBranchRef"])
-        name = (data.get("defaultBranchRef") or {}).get("name")
+        name = self.json(["api", f"repos/{self.slug}"]).get("default_branch")
         if not name:
             raise common.RepoError(f"{self.slug}: repo has no default branch")
         return name
@@ -623,29 +757,29 @@ class GitHub(Adapter):
 
     def conflict_files(self, n) -> list[str]:
         try:
-            data = self.json(["pr", "view", str(n), "--json", "files"])
+            files = self.pages(f"repos/{self.slug}/pulls/{n}/files?per_page=100")
         except common.RepoError:
             return []
-        return [f["path"] for f in data.get("files", []) if f.get("path")]
+        return [f["filename"] for f in files if f.get("filename")]
 
     def list_open(self) -> list[dict]:
-        fields = "number,url,title,body,createdAt,mergeable,mergeStateStatus,statusCheckRollup"
-        prs = self.json(["pr", "list", "--state", "open", "--limit", "100", "--json", fields])
-        items = [
-            {
-                "n": pr["number"],
-                "url": pr.get("url") or "",
-                "title": pr.get("title") or "",
-                "body": pr.get("body") or "",
-                "created": pr.get("createdAt") or "",
-                "checks": self.reduce_checks(pr.get("statusCheckRollup")),
-                "mergeable": self.mergeability(
-                    pr.get("mergeable"), pr.get("mergeStateStatus") or "UNKNOWN"
-                ),
-                "raw": pr,
-            }
-            for pr in prs or []
-        ]
+        # The REST list lacks mergeable and the checks; each PR's detail has them.
+        listed = self.pages(f"repos/{self.slug}/pulls?state=open&per_page=100")
+        items = []
+        for entry in listed:
+            pr = self.snapshot(self.json(["api", f"repos/{self.slug}/pulls/{entry['number']}"]))
+            items.append(
+                {
+                    "n": pr["number"],
+                    "url": pr["url"],
+                    "title": pr["title"],
+                    "body": pr["body"],
+                    "created": pr["createdAt"],
+                    "checks": self.reduce_checks(pr["statusCheckRollup"]),
+                    "mergeable": self.mergeability(pr["mergeable"], pr["mergeStateStatus"]),
+                    "raw": pr,
+                }
+            )
         return sorted(items, key=lambda item: item["created"])
 
 

@@ -15,5 +15,20 @@
   },
   "permissions": {
     "allow": []
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/cloud_session_start.py\"",
+            "timeout": 600,
+            "statusMessage": "Preparing the cloud session..."
+          }
+        ]
+      }
+    ]
   }
 }
