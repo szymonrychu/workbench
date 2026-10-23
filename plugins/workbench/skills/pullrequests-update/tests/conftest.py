@@ -18,16 +18,20 @@ import json, os, sys
 argv = sys.argv[1:]
 with open(os.environ["STUB_LOG"], "a") as f:
     f.write(json.dumps(["gh", *argv]) + "\\n")
-if argv[:2] == ["pr", "list"]:
-    print("[]")
-elif argv[:2] == ["pr", "create"]:
-    print("https://github.com/acme/gh-repo/pull/5")
-elif argv[:2] in (["pr", "edit"], ["label", "create"]):
-    pass
-elif argv[:2] == ["pr", "view"]:
-    print(json.dumps({"labels": []}))
-else:
+if argv[0] != "api":
     sys.exit(1)
+method = argv[argv.index("-X") + 1] if "-X" in argv else "GET"
+endpoint = [a for a in argv[1:] if a.startswith("repos/")][0]
+if method == "GET" and "/pulls?" in endpoint:
+    print("[]")
+elif method == "GET" and endpoint.endswith("/issues/5/labels?per_page=100"):
+    print("[[]]")
+elif method == "GET":
+    print(json.dumps({"default_branch": "main"}))
+elif method == "POST" and endpoint.endswith("/pulls"):
+    print(json.dumps({"html_url": "https://github.com/acme/gh-repo/pull/5"}))
+else:
+    print("{}")
 """
 
 GLAB_SHIM = """#!/usr/bin/env python3

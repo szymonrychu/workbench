@@ -9,8 +9,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_lib" / "tests"))
 
 import common  # noqa: E402
+import fake_gh_rest  # noqa: E402
 import review_state  # noqa: E402
 import scm  # noqa: E402
 
@@ -19,12 +21,16 @@ def _run(cmd, cwd):
     subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True)
 
 
-GH_SHIM = textwrap.dedent(
-    """\
+GH_SHIM = fake_gh_rest.shim(
+    textwrap.dedent(
+        """\
     #!/usr/bin/env python3
     import json
     import os
     import sys
+
+    sys.path.insert(0, "__FAKE_GH_DIR__")
+    import fake_gh_rest
 
     BOT = "review-bot"
     OTHER = "someone-else"
@@ -49,17 +55,17 @@ GH_SHIM = textwrap.dedent(
             "url": "https://github.com/acme/repo1/pull/602",
             "reviews": [
                 {
-                    "author": {"login": OTHER},
+                    "user": {"login": OTHER},
                     "state": "APPROVED",
-                    "submittedAt": "2026-07-01T09:00:00Z",
-                    "commit": {"oid": "headB"},
+                    "submitted_at": "2026-07-01T09:00:00Z",
+                    "commit_id": "headB",
                     "body": "lgtm from a human",
                 },
                 {
-                    "author": {"login": BOT},
+                    "user": {"login": BOT},
                     "state": "CHANGES_REQUESTED",
-                    "submittedAt": "2026-07-01T10:00:00Z",
-                    "commit": {"oid": "headB"},
+                    "submitted_at": "2026-07-01T10:00:00Z",
+                    "commit_id": "headB",
                     "body": "Found a real bug in foo.go:42",
                 },
             ],
@@ -72,10 +78,10 @@ GH_SHIM = textwrap.dedent(
             "url": "https://github.com/acme/repo1/pull/603",
             "reviews": [
                 {
-                    "author": {"login": BOT},
+                    "user": {"login": BOT},
                     "state": "CHANGES_REQUESTED",
-                    "submittedAt": "2026-07-01T10:00:00Z",
-                    "commit": {"oid": "headC-old"},
+                    "submitted_at": "2026-07-01T10:00:00Z",
+                    "commit_id": "headC-old",
                     "body": "stale finding",
                 }
             ],
@@ -88,17 +94,17 @@ GH_SHIM = textwrap.dedent(
             "url": "https://github.com/acme/repo1/pull/604",
             "reviews": [
                 {
-                    "author": {"login": BOT},
+                    "user": {"login": BOT},
                     "state": "CHANGES_REQUESTED",
-                    "submittedAt": "2026-07-01T10:00:00Z",
-                    "commit": {"oid": "headD"},
+                    "submitted_at": "2026-07-01T10:00:00Z",
+                    "commit_id": "headD",
                     "body": "Bug: nil deref in bar.go",
                 },
                 {
-                    "author": {"login": BOT},
+                    "user": {"login": BOT},
                     "state": "APPROVED",
-                    "submittedAt": "2026-07-01T10:05:00Z",
-                    "commit": {"oid": "headD"},
+                    "submitted_at": "2026-07-01T10:05:00Z",
+                    "commit_id": "headD",
                     "body": "Approve. Looks fine now.",
                 },
             ],
@@ -119,10 +125,10 @@ GH_SHIM = textwrap.dedent(
             "url": "https://github.com/acme/repo1/pull/606",
             "reviews": [
                 {
-                    "author": {"login": BOT},
+                    "user": {"login": BOT},
                     "state": "APPROVED",
-                    "submittedAt": "2026-07-01T10:00:00Z",
-                    "commit": {"oid": "headF"},
+                    "submitted_at": "2026-07-01T10:00:00Z",
+                    "commit_id": "headF",
                     "body": "",
                 }
             ],
@@ -149,25 +155,23 @@ GH_SHIM = textwrap.dedent(
         if log:
             with open(log, "a") as fh:
                 fh.write(json.dumps({"argv": argv, "env": dict(os.environ)}) + "\\n")
-        if argv[0] == "pr" and argv[1] == "view":
-            selector = argv[2]
-            num = BRANCHES.get(selector, selector)
-            json_idx = argv.index("--json")
-            fields = argv[json_idx + 1].split(",")
-            if num not in PRS:
-                sys.stderr.write("GraphQL: could not resolve to a PullRequest\\n")
-                sys.exit(1)
-            if fields == ["number"]:
-                print(json.dumps({"number": int(num)}))
-                return
-            data = PRS[num]
-            print(json.dumps({k: data.get(k) for k in fields}))
-            return
         if argv[0] == "api":
-            path = argv[1]
-            num = path.rsplit("/", 2)[1]
-            print(json.dumps(COMMENTS.get(num, [])))
-            return
+            world = {
+                "slug": "acme/repo1",
+                "prs": {
+                    num: {k: v for k, v in data.items() if k != "reviews"}
+                    for num, data in PRS.items()
+                },
+                "branches": BRANCHES,
+                "reviews": {num: data["reviews"] for num, data in PRS.items()},
+                "comments": COMMENTS,
+            }
+            # the self-hosted test targets another slug: serve the same data under it
+            slug = next((a for a in argv if a.startswith("repos/")), "repos/acme/repo1")
+            world["slug"] = "/".join(slug.split("?")[0].split("/")[1:3])
+            code = fake_gh_rest.serve(argv, world)
+            if code is not None:
+                sys.exit(code)
         sys.stderr.write(f"unhandled gh args: {argv}\\n")
         sys.exit(1)
 
@@ -175,6 +179,7 @@ GH_SHIM = textwrap.dedent(
     if __name__ == "__main__":
         main()
     """
+    )
 )
 
 
@@ -253,14 +258,14 @@ def test_parse_pr_pairs_invalid_entry_raises():
 def test_reviews_by_reviewer_filters_and_tags_on_head():
     reviews = [
         {
-            "author": {"login": "someone-else"},
+            "user": {"login": "someone-else"},
             "state": "APPROVED",
-            "commit": {"oid": "h"},
+            "commit_id": "h",
         },
         {
-            "author": {"login": "bot"},
+            "user": {"login": "bot"},
             "state": "CHANGES_REQUESTED",
-            "commit": {"oid": "old"},
+            "commit_id": "old",
         },
     ]
     out = review_state.reviews_by_reviewer(reviews, "bot", "h")
@@ -272,16 +277,16 @@ def test_reviews_by_reviewer_filters_and_tags_on_head():
 def test_reviews_by_reviewer_sorts_newest_first():
     reviews = [
         {
-            "author": {"login": "bot"},
+            "user": {"login": "bot"},
             "state": "CHANGES_REQUESTED",
-            "submittedAt": "2026-07-01T10:00:00Z",
-            "commit": {"oid": "h"},
+            "submitted_at": "2026-07-01T10:00:00Z",
+            "commit_id": "h",
         },
         {
-            "author": {"login": "bot"},
+            "user": {"login": "bot"},
             "state": "APPROVED",
-            "submittedAt": "2026-07-01T10:05:00Z",
-            "commit": {"oid": "h"},
+            "submitted_at": "2026-07-01T10:05:00Z",
+            "commit_id": "h",
         },
     ]
     out = review_state.reviews_by_reviewer(reviews, "bot", "h")
@@ -566,3 +571,21 @@ def test_self_hosted_github_via_host_map(workbench, gh_shim, capsys, monkeypatch
     for call in calls:
         assert "git.corp.example" in " ".join(call["argv"]), call["argv"]
         assert "GH_HOST" not in call["env"]
+
+
+def test_review_state_uses_rest_only(workbench, gh_shim):
+    """Retirement pin: `gh pr view --json` is GraphQL, blocked in Claude Code cloud sessions."""
+    review_state.process_pr("repo1", 602, "review-bot")
+    review_state.process_branch("repo1", "feature-x", "review-bot")
+    calls = [json.loads(x) for x in (gh_shim.parent / "calls.jsonl").read_text().splitlines()]
+    assert calls
+    for call in calls:
+        assert call["argv"][0] == "api" and "graphql" not in call["argv"], call["argv"]
+
+
+def test_pull_state_is_mapped_from_rest(workbench, gh_shim):
+    entry = review_state.process_pr("repo1", 602, "review-bot")
+    assert entry["prState"] == "OPEN"
+    assert entry["mergeable"] == "MERGEABLE"
+    assert entry["url"] == "https://github.com/acme/repo1/pull/602"
+    assert entry["headSha"] == "headB"

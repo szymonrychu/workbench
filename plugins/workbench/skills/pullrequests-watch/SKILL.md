@@ -122,11 +122,17 @@ reports checks and mergeability.
 
 ## GitHub review threads
 
+Every GitHub call is `gh api repos/{owner}/{repo}/...` REST (PR via `pulls/<n>`,
+checks via `commits/<sha>/check-runs` and `/status`), never `gh pr`, `gh repo view`
+or `gh label`: those are GraphQL, which Claude Code cloud sessions block (HTTP 403).
+
 On GitHub, every poll (watch and `--no-wait`) of an OPEN PR also counts its
 unresolved review threads through `scm.GitHub.unresolved_reviews`: one
 `gh api graphql` call over `reviewThreads` (first 100, further calls only while
 `pageInfo.hasNextPage`), counting every thread with `isResolved: false`,
-outdated ones included (as GitLab does). The count is the same
+outdated ones included (as GitLab does). In a Claude Code cloud session
+(`CLAUDE_CODE_REMOTE=true`) the count comes from the proxy's REST route
+`gh api repos/{owner}/{repo}/pulls/<n>/ccr/review_threads` instead. The count is the same
 `reviews=<N> unresolved` field and `<N> unresolved review discussion(s)` reason
 as GitLab, and likewise never flips `STATUS` to `failed`, so the merge gate
 `reviews=0` holds on both hosts. A merged or closed PR emits no `reviews=`
@@ -145,7 +151,7 @@ both hosts. It takes `--prs` or `--repos`, never `--branch/--repos` mixed with `
   (GitLab). Detail prefix: `pr #N deploy:` / `mr !N deploy:`.
 - `--deploy --repos a,b [--branch B]`: watches branch `--branch`, default the
   repo's `.gitmodules` branch (`common.tracked_branch`); on GitHub the repo's
-  default branch (`gh repo view --json defaultBranchRef`) only when no
+  default branch (`gh api repos/<o>/<r>`, `.default_branch`) only when no
   `.gitmodules` branch is set. Detail prefix: `deploy:`.
 - `--sha repo1=SHA,repo2=SHA`: pins a repo to a commit (only with
   `--deploy --repos`; every repo named must be in `--repos`). Using `--sha`

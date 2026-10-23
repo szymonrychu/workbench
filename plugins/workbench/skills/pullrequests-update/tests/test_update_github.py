@@ -23,31 +23,48 @@ with open(os.environ["GH_STUB_LOG"], "a") as f:
     f.write(json.dumps(argv) + "\\n")
 
 
-def flag(name):
-    if name in argv:
-        return argv[argv.index(name) + 1]
-    return None
-
-
-if argv[:2] == ["pr", "list"]:
+if argv[0] != "api":
+    sys.exit(1)
+method = argv[argv.index("-X") + 1] if "-X" in argv else "GET"
+endpoint = next(a for a in argv[1:] if a.startswith("repos/")).split("?")[0]
+parts = endpoint.split("/")
+slug, rest = "/".join(parts[1:3]), parts[3:]
+if method == "GET" and rest == ["pulls"]:
     existing = json.loads(os.environ.get("GH_STUB_EXISTING", "{}"))
-    entry = existing.get(flag("-R"))
-    print(json.dumps([entry] if entry else []))
-elif argv[:2] == ["pr", "create"]:
+    entry = existing.get(slug)
+    print(json.dumps([{"number": entry["number"], "html_url": entry["url"]}] if entry else []))
+elif method == "GET" and rest == []:
+    print(json.dumps({"default_branch": "main"}))
+elif method == "POST" and rest == ["pulls"]:
     urls = json.loads(os.environ.get("GH_STUB_CREATE_URLS", "{}"))
-    print(urls[flag("-R")])
-elif argv[:2] == ["pr", "edit"]:
-    pass
-elif argv[:2] == ["pr", "view"]:
+    print(json.dumps({"html_url": urls[slug]}))
+elif method == "GET" and rest[0] == "issues" and rest[2:] == ["labels"]:
     labels = json.loads(os.environ.get("GH_STUB_LABELS", "{}"))
-    target = argv[2] if len(argv) > 2 else None
-    names = labels.get(target, [])
-    print(json.dumps({"labels": [{"name": n} for n in names]}))
-elif argv[:2] == ["label", "create"]:
-    pass
+    print(json.dumps([[{"name": n} for n in labels.get(rest[1], [])]]))
+elif method in ("POST", "PATCH"):
+    print("{}")
 else:
     sys.exit(1)
 """
+
+
+def field(call, name):
+    prefix = name + "="
+    return next(a[len(prefix) :] for a in call if a.startswith(prefix))
+
+
+def api_calls(calls, method, suffix=""):
+    """The recorded `gh api -X <method> repos/...` calls whose endpoint ends in `suffix`."""
+    return [c for c in calls if c[:3] == ["api", "-X", method] and c[3].endswith(suffix)]
+
+
+def label_creates(calls):
+    """The repo-level `POST repos/<owner>/<repo>/labels` calls (not a PR's label list)."""
+    return [c for c in api_calls(calls, "POST", "/labels") if c[3].count("/") == 3]
+
+
+def label_reads(calls):
+    return [c for c in calls if c[0] == "api" and "/issues/" in c[-1] and "/labels" in c[-1]]
 
 
 def _init_repo(path, origin_url):
@@ -155,14 +172,14 @@ def test_create_and_edit_branching(workbench, gh_stub, monkeypatch, capsys):
     assert "https://github.com/acme/repo-https/pull/7" in out
 
     calls = gh_stub()
-    create_calls = [c for c in calls if c[:2] == ["pr", "create"]]
+    create_calls = api_calls(calls, "POST", "/pulls")
     assert len(create_calls) == 1
-    assert "-R" in create_calls[0]
-    assert create_calls[0][create_calls[0].index("-R") + 1] == "acme/repo-ssh"
-    assert "--title" in create_calls[0]
-    assert create_calls[0][create_calls[0].index("--title") + 1] == "Add feature X"
+    assert create_calls[0][3] == "repos/acme/repo-ssh/pulls"
+    assert field(create_calls[0], "title") == "Add feature X"
+    assert field(create_calls[0], "head") == "feature/x"
+    assert field(create_calls[0], "base") == "main"
 
-    list_calls = [c for c in calls if c[:2] == ["pr", "list"]]
+    list_calls = [c for c in calls if c[0] == "api" and "/pulls?state=open" in c[1]]
     assert len(list_calls) == 2
 
 
@@ -194,14 +211,14 @@ def test_pass_two_cross_links_siblings_and_omits_self(workbench, gh_stub, monkey
     assert exc.value.code == 0
 
     calls = gh_stub()
-    edit_calls = [c for c in calls if c[:2] == ["pr", "edit"]]
+    edit_calls = api_calls(calls, "PATCH")
     # pass 2 issues one edit per repo (pass 1 only edits pre-existing PRs; both here are new)
     assert len(edit_calls) == 2
 
     def body_for(url):
         for c in edit_calls:
-            if c[2] == url.rsplit("/", 1)[1]:
-                return c[c.index("--body") + 1]
+            if c[3].rsplit("/", 1)[1] == url.rsplit("/", 1)[1]:
+                return field(c, "body")
         raise AssertionError(f"no edit call for {url}")
 
     ssh_body = body_for("https://github.com/acme/repo-ssh/pull/1")
@@ -249,7 +266,7 @@ def test_aggregate_report_and_exit_code_with_unknown_repo(workbench, gh_stub, mo
     assert "failed" in out
 
     calls = gh_stub()
-    assert not any(c[:2] == ["pr", "list"] and "nope" in json.dumps(c) for c in calls)
+    assert not any("nope" in json.dumps(c) for c in calls)
 
 
 def test_missing_body_is_reported_as_failure(workbench, gh_stub, monkeypatch, capsys):
@@ -298,13 +315,13 @@ def test_semver_applies_when_absent(workbench, gh_stub, monkeypatch, capsys):
     assert "semver:patch applied" in out
 
     calls = gh_stub()
-    label_create = [c for c in calls if c[:2] == ["label", "create"]]
+    label_create = label_creates(calls)
     assert len(label_create) == 1
-    assert label_create[0][2] == "semver:patch"
+    assert field(label_create[0], "name") == "semver:patch"
 
-    add_label_calls = [c for c in calls if c[:2] == ["pr", "edit"] and "--add-label" in c]
+    add_label_calls = api_calls(calls, "POST", "/issues/10/labels")
     assert len(add_label_calls) == 1
-    assert add_label_calls[0][add_label_calls[0].index("--add-label") + 1] == "semver:patch"
+    assert "labels[]=semver:patch" in add_label_calls[0]
 
 
 def test_semver_skipped_when_already_present(workbench, gh_stub, monkeypatch, capsys):
@@ -336,8 +353,9 @@ def test_semver_skipped_when_already_present(workbench, gh_stub, monkeypatch, ca
     assert "semver skipped (has semver:major)" in out
 
     calls = gh_stub()
-    assert not any(c[:2] == ["label", "create"] for c in calls)
-    assert not any(c[:2] == ["pr", "edit"] and "--add-label" in c for c in calls)
+    assert label_reads(calls)
+    assert label_creates(calls) == []
+    assert api_calls(calls, "POST", "/issues/11/labels") == []
 
 
 def test_semver_invalid_level_is_per_repo_failure(workbench, gh_stub, monkeypatch, capsys):
@@ -369,8 +387,8 @@ def test_semver_invalid_level_is_per_repo_failure(workbench, gh_stub, monkeypatc
     assert "https://github.com/acme/repo-ssh/pull/12" in out
 
     calls = gh_stub()
-    assert not any(c[:2] == ["label", "create"] for c in calls)
-    assert not any(c[:2] == ["pr", "view"] for c in calls)
+    assert label_creates(calls) == []
+    assert label_reads(calls) == []
 
 
 def test_semver_missing_is_noop(workbench, gh_stub, monkeypatch, capsys):
@@ -396,8 +414,8 @@ def test_semver_missing_is_noop(workbench, gh_stub, monkeypatch, capsys):
     assert "| -" in out
 
     calls = gh_stub()
-    assert not any(c[:2] == ["pr", "view"] for c in calls)
-    assert not any(c[:2] == ["label", "create"] for c in calls)
+    assert label_reads(calls) == []
+    assert label_creates(calls) == []
 
 
 def test_semver_creates_label_if_missing(workbench, gh_stub, monkeypatch):
@@ -424,14 +442,12 @@ def test_semver_creates_label_if_missing(workbench, gh_stub, monkeypatch):
     assert exc.value.code == 0
 
     calls = gh_stub()
-    label_create = [c for c in calls if c[:2] == ["label", "create"]]
+    label_create = label_creates(calls)
     assert len(label_create) == 1
     call = label_create[0]
-    assert call[2] == "semver:major"
-    assert "-R" in call
-    assert call[call.index("-R") + 1] == "acme/repo-ssh"
-    assert "--force" in call
-    assert "--color" in call
+    assert call[3] == "repos/acme/repo-ssh/labels"
+    assert field(call, "name") == "semver:major"
+    assert field(call, "color") == "d93f0b"
 
 
 def test_semver_failure_does_not_abort_other_repos(workbench, gh_stub, monkeypatch, capsys):
@@ -470,9 +486,9 @@ def test_semver_failure_does_not_abort_other_repos(workbench, gh_stub, monkeypat
     assert "semver:minor applied" in out
 
     calls = gh_stub()
-    label_create = [c for c in calls if c[:2] == ["label", "create"]]
+    label_create = label_creates(calls)
     assert len(label_create) == 1
-    assert label_create[0][2] == "semver:minor"
+    assert field(label_create[0], "name") == "semver:minor"
 
 
 def test_mixed_hosts_one_run(mixed_workbench, mixed_stubs, run_mixed, capsys):
@@ -496,13 +512,17 @@ def test_mixed_hosts_one_run(mixed_workbench, mixed_stubs, run_mixed, capsys):
     assert "https://gitlab.com/acme/gl-repo/-/merge_requests/8 | semver:patch applied" in out
 
     calls = mixed_stubs()
-    gh_edit = [c for c in calls if c[:3] == ["gh", "pr", "edit"] and "--body" in c]
+    gh_edit = [
+        c
+        for c in calls
+        if c[:4] == ["gh", "api", "-X", "PATCH"] and any(a.startswith("body=") for a in c)
+    ]
     gl_put = [
         c
         for c in calls
         if c[0] == "glab" and "PUT" in c and any(a.startswith("description=") for a in c)
     ]
-    gh_body = gh_edit[0][gh_edit[0].index("--body") + 1]
+    gh_body = [a for a in gh_edit[0] if a.startswith("body=")][0][len("body=") :]
     gl_body = [a for a in gl_put[0] if a.startswith("description=")][0]
     assert "## Complementary PRs" in gh_body
     assert "https://gitlab.com/acme/gl-repo/-/merge_requests/8" in gh_body
