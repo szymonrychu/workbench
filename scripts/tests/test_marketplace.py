@@ -55,6 +55,9 @@ def test_pack_manifests():
         assert p["author"] == {"name": "workbench contributors"}
 
 
+HOOK = 'python3 "$CLAUDE_PROJECT_DIR/scripts/cloud_session_start.py"'
+
+
 def test_project_settings_exact():
     assert _json(".claude/settings.json") == {
         "extraKnownMarketplaces": {
@@ -67,6 +70,21 @@ def test_project_settings_exact():
             "workbench-secrets@workbench-template": False,
         },
         "permissions": {"allow": []},
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "startup|resume",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": HOOK,
+                            "timeout": 600,
+                            "statusMessage": "Preparing the cloud session...",
+                        }
+                    ],
+                }
+            ]
+        },
     }
 
 

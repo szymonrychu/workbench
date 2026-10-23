@@ -113,7 +113,14 @@ def test_no_personal_or_stale_content():
 def test_claude_md():
     assert CLAUDE.splitlines()[0] == "@AGENTS.md"
     assert "## Claude Code only" in CLAUDE
-    for needle in ("workbench:<skill>", "/reload-plugins", "Workflow", "trust dialog", "heartbeat"):
+    for needle in (
+        "workbench:<skill>",
+        "/reload-plugins",
+        "Workflow",
+        "trust dialog",
+        "heartbeat",
+        "docs/claude-cloud.md",
+    ):
         assert needle in CLAUDE
 
 
